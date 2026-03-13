@@ -1,0 +1,250 @@
+/*
+ * ============================================================
+ *  BENCHMARK: Multiplicación de Matrices  N x N
+ *  Comparativa C vs Ensamblador x86 (IA-32) embebido
+ *
+ *  Compilar (MSVC 32-bit, Visual Studio):
+ *      cl /O2 /arch:IA32 benchmark_matrices.cpp
+ *
+ *  Compilar (MinGW 32-bit, sin optimizaciones para ver diferencia):
+ *      g++ -m32 -O0 -o benchmark benchmark_matrices.cpp
+ *
+ *  NOTA: El bloque __asm requiere compilador de 32 bits.
+ *        En 64 bits (GCC/Clang) usar MSVC x86 o sustituir
+ *        el bloque ASM por la versión en archivo .asm externo.
+ * ============================================================
+ */
+
+#include <stdio.h>
+#include <time.h>
+#include <stdint.h>
+
+ /* ── Parámetro principal ──────────────────────────────────── */
+#define N 1000          /* Tamaño de la matriz N×N            */
+                        /* Cambia a 500 o 2000 para escalar   */
+
+/* ── Matrices estáticas globales ─────────────────────────── */
+/* Globales para facilitar el acceso desde el bloque __asm    */
+static int A[N][N];   /* Entrada A                        */
+static int B[N][N];   /* Entrada B                        */
+static int C[N][N];   /* Resultado versión C              */
+static int C_ASM[N][N];   /* Resultado versión ASM            */
+
+/* ============================================================
+ *  1. INICIALIZACIÓN DETERMINISTA DE MATRICES
+ *     A[i][j] = (i + j) % 100
+ *     B[i][j] = (i - j) % 100
+ *  Sin rand() → mismos valores en cualquier máquina/SO
+ * ============================================================ */
+void inicializarMatrices() {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            A[i][j] = (i + j) % 100;
+            B[i][j] = (i - j) % 100;
+        }
+    }
+}
+
+/* ============================================================
+ *  2. MULTIPLICACIÓN EN C  (referencia)
+ *     Tres bucles anidados clásicos, orden i-j-k
+ *     Complejidad: O(N^3)
+ * ============================================================ */
+void multiplicarMatricesC() {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            C[i][j] = 0;
+            for (int k = 0; k < N; k++) {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
+
+/* ============================================================
+ *  3. MULTIPLICACIÓN EN ENSAMBLADOR x86 (IA-32) embebido
+ *     Registros:
+ *       ESI → i        EDI → j       ECX → k
+ *       EAX → acumulador (sum de C_ASM[i][j])
+ *       EBX → offset base de la fila i de A  (i*N*4 bytes)
+ *       EDX → carga temporal de A[i][k] y producto
+ *       EBP → carga temporal de B[k][j]
+ * ============================================================ */
+void multiplicarMatricesASM() {
+    __asm {
+
+        push ebx
+        push esi
+        push edi
+        push ebp
+
+        xor esi, esi           /* i = 0 */
+
+        LOOP_I :
+        cmp  esi, N
+            jge  END_LOOP_I
+
+            /* ── Offset base de la fila i de A: EBX = i*N*4 ── */
+            mov  ebx, esi
+            imul ebx, N
+            shl  ebx, 2             /* EBX = (i*N) bytes */
+
+            xor edi, edi           /* j = 0 */
+
+            LOOP_J :
+        cmp  edi, N
+            jge  END_LOOP_J
+
+            xor eax, eax           /* acumulador = 0 (C_ASM[i][j] temporal) */
+            xor ecx, ecx           /* k = 0 */
+
+            LOOP_K :
+        cmp  ecx, N
+            jge  END_LOOP_K
+
+            /* ── Cargar A[i][k] ──────────────────────────────── */
+            mov  edx, ecx
+            shl  edx, 2             /* edx = k*4 */
+            mov  edx, [A + ebx + edx]  /* edx = A[i*N+k] */
+
+            /* ── Cargar B[k][j] ──────────────────────────────── */
+            mov  ebp, ecx
+            imul ebp, N
+            add  ebp, edi
+            shl  ebp, 2             /* ebp = (k*N+j)*4 */
+            mov  ebp, [B + ebp]    /* ebp = B[k][j]   */
+
+            /* ── Producto y acumulación ───────────────────────── */
+            imul edx, ebp           /* edx = A[i][k] * B[k][j] */
+            add  eax, edx           /* sum += producto           */
+
+            inc  ecx
+            jmp  LOOP_K
+
+
+            END_LOOP_K :
+        /* ── Guardar C_ASM[i][j] = EAX ───────────────────── */
+        mov  edx, esi
+            imul edx, N
+            add  edx, edi
+            shl  edx, 2             /* edx = (i*N+j)*4 */
+            mov[C_ASM + edx], eax
+
+            inc  edi
+            jmp  LOOP_J
+
+            END_LOOP_J :
+        inc  esi
+            jmp  LOOP_I
+
+            END_LOOP_I :
+        pop  ebp
+            pop  edi
+            pop  esi
+            pop  ebx
+            pop  ebp
+    }
+}
+
+/* ============================================================
+ *  4. VALIDACIÓN
+ *     Compara elemento central y esquinas entre C y C_ASM
+ *     Retorna 1 si todo coincide, 0 si hay diferencias
+ * ============================================================ */
+int validarResultados() {
+    /* Verificamos 5 posiciones representativas */
+    int posiciones[5][2] = {
+        {0,       0      },
+        {0,       N - 1    },
+        {N / 2,     N / 2    },
+        {N - 1,     0      },
+        {N - 1,     N - 1    }
+    };
+
+    for (int p = 0; p < 5; p++) {
+        int i = posiciones[p][0];
+        int j = posiciones[p][1];
+        if (C[i][j] != C_ASM[i][j]) {
+            printf("  [FALLO] C[%d][%d] = %d  !=  C_ASM[%d][%d] = %d\n",
+                i, j, C[i][j], i, j, C_ASM[i][j]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ============================================================
+ *  5. MAIN: Coordina inicialización, ejecución y análisis
+ * ============================================================ */
+int main() {
+    clock_t inicio, fin;
+    double  tiempoC, tiempoASM;
+
+    printf("==========================================================\n");
+    printf("  BENCHMARK: Multiplicacion de Matrices %dx%d\n", N, N);
+    printf("  Comparativa C vs Ensamblador x86 (IA-32)\n");
+    printf("==========================================================\n\n");
+
+    /* ── PASO 1: Inicializar matrices ─────────────────────── */
+    printf("[1/4] Inicializando matrices A y B ... ");
+    inicializarMatrices();
+    printf("OK\n");
+
+    /* ── PASO 2: Ejecutar version C y medir tiempo ─────────── */
+    printf("[2/4] Ejecutando multiplicarMatricesC()    ... ");
+    inicio = clock();
+    multiplicarMatricesC();
+    fin = clock();
+    tiempoC = (double)(fin - inicio) / CLOCKS_PER_SEC;
+    printf("OK\n");
+
+    /* ── PASO 3: Ejecutar version ASM y medir tiempo ─────────── */
+    printf("[3/4] Ejecutando multiplicarMatricesASM()  ... ");
+    inicio = clock();
+    multiplicarMatricesASM();
+    fin = clock();
+    tiempoASM = (double)(fin - inicio) / CLOCKS_PER_SEC;
+    printf("OK\n");
+
+    /* ── PASO 4: Validacion de resultados ────────────────────── */
+    printf("[4/4] Validando resultados (C vs ASM)      ... ");
+    int valido = validarResultados();
+    printf("%s\n\n", valido ? "CORRECTO" : "*** FALLO ***");
+
+    /* ── TABLA DE RESULTADOS ─────────────────────────────────── */
+    printf("----------------------------------------------------------\n");
+    printf("  RESULTADOS\n");
+    printf("----------------------------------------------------------\n");
+    printf("  Tiempo C          : %.6f segundos\n", tiempoC);
+    printf("  Tiempo ASM        : %.6f segundos\n", tiempoASM);
+
+    double speedup = (tiempoASM > 0.0) ? (tiempoC / tiempoASM) : 0.0;
+    printf("  Speedup (Tc/Tasm) : %.4f x\n", speedup);
+
+    if (speedup > 1.0)
+        printf("  -> La version ASM es %.2fx MAS RAPIDA que C\n", speedup);
+    else if (speedup < 1.0)
+        printf("  -> La version ASM es %.2fx MAS LENTA que C\n", 1.0 / speedup);
+    else
+        printf("  -> Ambas versiones tienen el mismo rendimiento\n");
+
+
+    /* ── INSTRUCCIONES PARA EL ANALISIS ──────────────────────── */
+    printf("\n==========================================================\n");
+    printf("  METRICAS PARA EL INFORME\n");
+    printf("==========================================================\n");
+    printf("  Instrucciones dinamicas estimadas : ~%.0f M\n",
+        (double)N * N * N * 8.0 / 1e6);
+    printf("  Tamanyo de cada matriz            : %lu KB\n",
+        (unsigned long)(N * N * sizeof(int) / 1024));
+    printf("  Huella total de memoria (3 mat.)  : %lu KB\n",
+        (unsigned long)(3UL * N * N * sizeof(int) / 1024));
+    printf("\n  Anota estos datos en la tabla comparativa:\n");
+    printf("    - Tiempo C   : %.6f s\n", tiempoC);
+    printf("    - Tiempo ASM : %.6f s\n", tiempoASM);
+    printf("    - Speedup    : %.4f\n", speedup);
+    printf("    - Validacion : %s\n", valido ? "OK" : "FALLO");
+    printf("==========================================================\n");
+
+    return 0;
+}
